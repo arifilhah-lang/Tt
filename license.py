@@ -1,15 +1,20 @@
 import os
-from flask import Flask, request, jsonify, render_template_string, redirect, send_file
+from flask import Flask, request, jsonify, render_template_string, redirect, send_file, session
 import sqlite3
 import random
 import string
 from datetime import datetime, timedelta
+from functools import wraps
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "pagla_license_server_key_2026")
 
+# ================= 🔐 ADMIN CREDENTIALS =================
+# Railway Environment Variables থেকে ইউজারনেম/পাসওয়ার্ড নিবে, না পেলে ডিফল্টটা ব্যবহার করবে।
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
+
 # ================= 🔧 RAILWAY CLOUD SETUP =================
-# Railway তে ডাটা যেন ডিলিট না হয়, তাই আমরা /app/data ডিরেক্টরি ব্যবহার করবো
 DATA_DIR = os.environ.get('DATA_DIR', '/app/data')
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -43,6 +48,55 @@ def init_db():
 
 init_db()
 
+# ================= 🛡️ LOGIN SYSTEM =================
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('logged_in'):
+            return redirect('/login')
+        return f(*args, **kwargs)
+    return decorated_function
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    error = ""
+    if request.method == 'POST':
+        if request.form.get('username') == ADMIN_USER and request.form.get('password') == ADMIN_PASS:
+            session['logged_in'] = True
+            return redirect('/')
+        else:
+            error = "ভুল ইউজারনেম বা পাসওয়ার্ড!"
+            
+    html = f"""
+    <html><head><title>Admin Login</title>
+    <style>
+        body {{ font-family: sans-serif; background: #f4f6f9; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
+        .login-box {{ background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; width: 300px; }}
+        input {{ width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; }}
+        button {{ width: 100%; padding: 10px; background: #1155cc; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; }}
+        button:hover {{ background: #0b409c; }}
+        .error {{ color: red; margin-bottom: 10px; font-weight: bold; }}
+    </style>
+    </head><body>
+        <div class="login-box">
+            <h2 style="color:#1155cc;">Master Panel Login</h2>
+            {{% if error %}}<div class="error">{{{{ error }}}}</div>{{% endif %}}
+            <form method="POST">
+                <input type="text" name="username" placeholder="Username" required>
+                <input type="password" name="password" placeholder="Password" required>
+                <button type="submit">Login</button>
+            </form>
+        </div>
+    </body></html>
+    """
+    return render_template_string(html, error=error)
+
+@app.route('/logout')
+def logout():
+    session.pop('logged_in', None)
+    return redirect('/login')
+
+
 # ================= 🚀 AUTO UPDATE APIs =================
 @app.route('/check_update', methods=['POST'])
 def check_update():
@@ -59,6 +113,7 @@ def download_update():
     return "Update file not found!", 404
 
 @app.route('/publish_release', methods=['POST'])
+@login_required
 def publish_release():
     v = request.form.get('version')
     file = request.files.get('update_zip')
@@ -69,9 +124,15 @@ def publish_release():
 
 # ================= 🌐 MASTER PANEL UI =================
 @app.route('/')
+@login_required
 def dashboard():
     search = request.args.get('search', '').strip()
     filter_days = request.args.get('filter')
+    
+    # Session থেকে নতুন key বের করে মুছে ফেলা হচ্ছে (যাতে ২য় বার রিলোডে না দেখায়)
+    new_key = session.pop('new_generated_key', None)
+    new_shop = session.pop('new_generated_shop', None)
+
     conn = get_db()
     
     query = "SELECT * FROM licenses WHERE 1=1"
@@ -118,21 +179,36 @@ def dashboard():
         table{{width: 100%; border-collapse: collapse; background:white; box-shadow:0 4px 15px rgba(0,0,0,0.05); margin-bottom:30px; border-radius:8px; overflow:hidden;}} 
         th, td{{border-bottom: 1px solid #e1e5eb; padding: 12px; text-align: left;}} 
         th{{background: #1155cc; color:white; font-weight: 600;}} 
-        .th-expired{{background: #c0392b !important; color:white; font-weight: 600;}} 
         .btn{{padding: 8px 15px; text-decoration: none; color: white; border-radius: 6px; font-weight:bold; display:inline-flex; align-items:center; gap:5px; border:none; cursor:pointer; font-size:14px; transition:0.2s;}}
         .btn:hover{{opacity:0.8;}}
         input, select{{padding:10px; border: 1px solid #ccc; border-radius: 6px; width: 100%; box-sizing: border-box;}}
         .grid-2{{display: grid; grid-template-columns: 1fr 1fr; gap: 20px;}}
         .top-nav{{display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;}}
         .alert-card{{background: #fdf5f5; border-left: 5px solid #e74a3b; padding: 15px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); display: flex; justify-content: space-between; align-items: center;}}
+        .new-key-box {{ background: #e8f5e9; border: 2px dashed #27ae60; padding: 20px; margin-bottom: 20px; border-radius: 8px; text-align: center; animation: pulse 2s infinite; }}
+        @keyframes pulse {{ 0% {{ box-shadow: 0 0 0 0 rgba(39, 174, 96, 0.4); }} 70% {{ box-shadow: 0 0 0 10px rgba(39, 174, 96, 0); }} 100% {{ box-shadow: 0 0 0 0 rgba(39, 174, 96, 0); }} }}
     </style></head>
     <body>
         <div class="top-nav">
             <h2 style="color:#1155cc; margin:0;"><i class="fas fa-crown" style="color:#f1c40f;"></i> Master Control Panel</h2>
-            <a href="/fraud_logs" class="btn" style="background:#e74a3b; font-size: 16px; padding:10px 20px;">
-                <i class="fas fa-shield-alt"></i> Security Alerts <span style="background:white; color:red; padding:2px 8px; border-radius:10px; margin-left:5px; font-weight:bold;">{fraud_count}</span>
-            </a>
+            <div>
+                <a href="/fraud_logs" class="btn" style="background:#e74a3b; font-size: 16px; padding:10px 20px; margin-right: 10px;">
+                    <i class="fas fa-shield-alt"></i> Alerts <span style="background:white; color:red; padding:2px 8px; border-radius:10px; margin-left:5px; font-weight:bold;">{fraud_count}</span>
+                </a>
+                <a href="/logout" class="btn" style="background:#34495e; font-size: 16px; padding:10px 20px;"><i class="fas fa-sign-out-alt"></i> Logout</a>
+            </div>
         </div>
+        
+        {{% if new_key %}}
+        <div class="new-key-box">
+            <h2 style="color:#27ae60; margin-top:0;"><i class="fas fa-check-circle"></i> New License Created!</h2>
+            <p style="font-size: 18px; margin-bottom: 5px;">Client/Shop: <b>{{{{ new_shop }}}}</b></p>
+            <p style="font-size: 20px; margin: 0;">License Key: <br>
+                <input type="text" value="{{{{ new_key }}}}" id="copyKey" style="text-align:center; font-size:24px; font-weight:bold; color:#c0392b; width:50%; margin-top:10px;" readonly>
+            </p>
+            <small style="color:#555;">(Please copy this key now. It will disappear if you refresh the page)</small>
+        </div>
+        {{% endif %}}
         
         <div class="grid-2">
             <div class="card" style="border-top: 5px solid #27ae60;">
@@ -144,7 +220,6 @@ def dashboard():
                     </div>
                     <div style="display:flex; gap:10px;">
                         <input type="text" name="address" placeholder="Address / Location" style="flex:2;">
-                        
                         <select name="days" style="flex:1;" required>
                             <option value="7">1 Week Trial</option>
                             <option value="90">3 Months</option>
@@ -249,10 +324,11 @@ def dashboard():
         </table>
     </body></html>
     """
-    return render_template_string(html, active_licenses=active_licenses, expired_licenses=expired_licenses, current_version=current_version, fraud_count=fraud_count, search=search)
+    return render_template_string(html, active_licenses=active_licenses, expired_licenses=expired_licenses, current_version=current_version, fraud_count=fraud_count, search=search, new_key=new_key, new_shop=new_shop)
 
 # ================= 🚨 FRAUD DETECTION PAGE =================
 @app.route('/fraud_logs')
+@login_required
 def fraud_logs():
     conn = get_db()
     query = """
@@ -266,100 +342,4 @@ def fraud_logs():
     
     html = f"""
     <html><head><title>Security Alerts</title><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
-    <style>body{{font-family: 'Segoe UI', sans-serif; padding: 20px; background:#fce8e6;}} table{{width: 100%; border-collapse: collapse; background:white; box-shadow:0 4px 10px rgba(0,0,0,0.1);}} th, td{{border: 1px solid #ddd; padding: 12px;}} th{{background: #c0392b; color:white;}} .btn{{padding: 8px 12px; color: white; text-decoration:none; border-radius: 6px; font-weight:bold; display:inline-flex; align-items:center; gap:5px; transition:0.2s;}} .btn:hover{{opacity:0.8;}}</style></head>
-    <body>
-        <h2 style="color:#c0392b;"><i class="fas fa-shield-alt"></i> Security Alerts & Fraud Attempts</h2>
-        <a href="/" class="btn" style="margin-bottom:20px; background:#2c3e50;"><i class="fas fa-arrow-left"></i> Back to Dashboard</a>
-        <p style="font-weight:bold;">কেউ অন্য পিসিতে আপনার লাইসেন্স ব্যবহার করার চেষ্টা করলে এখানে ধরা পড়বে। আপনি তাকে কল দিয়ে ধরতে পারেন বা সরাসরি ব্যান করে দিতে পারেন!</p>
-        <table>
-            <tr><th>Date & Time</th><th>Client Info</th><th>Compromised Key</th><th>Registered PC</th><th>Thief's PC</th><th>Action</th></tr>
-            {{% for lg in logs %}}
-            <tr>
-                <td>{{{{ lg.attempt_date }}}}</td>
-                <td>
-                    <b>{{{{ lg.shop_name or 'Unknown' }}}}</b><br>
-                    <span style="font-size:18px; color:#27ae60; font-weight:bold;"><i class="fas fa-phone-alt"></i> {{{{ lg.phone or 'No Number' }}}}</span>
-                </td>
-                <td><code style="color:red; font-size:16px; font-weight:bold;">{{{{ lg.key }}}}</code></td>
-                <td>{{{{ lg.actual_domain }}}}</td>
-                <td style="color:#c0392b; font-weight:bold;"><i class="fas fa-desktop"></i> {{{{ lg.attempted_domain }}}}</td>
-                <td>
-                    <a href="/block_license/{{{{ lg.key }}}}" class="btn" style="background:#34495e; margin-bottom:5px;" onclick="return confirm('Ban this account instantly?')"><i class="fas fa-ban"></i> Ban Account</a><br>
-                    <a href="/delete_license/{{{{ lg.key }}}}" class="btn" style="background:#c0392b;" onclick="return confirm('Delete this Key permanently?')"><i class="fas fa-trash"></i> Delete Key</a>
-                </td>
-            </tr>
-            {{% endfor %}}
-            {{% if not logs %}}
-            <tr><td colspan="6" style="text-align:center; color:green; font-weight:bold;">No fraud attempts detected yet!</td></tr>
-            {{% endif %}}
-        </table>
-    </body></html>
-    """
-    return render_template_string(html, logs=logs)
-
-# ================= 🛠️ ACTIONS & LOGIC =================
-@app.route('/create', methods=['POST'])
-def create_license():
-    shop_name = request.form.get('shop_name'); phone = request.form.get('phone'); address = request.form.get('address')
-    days = int(request.form.get('days', 365))
-    key = "PAGLA-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=5)) + "-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=5)) + "-" + ''.join(random.choices(string.digits, k=4))
-    expiry = datetime.now() + timedelta(days=days)
-    conn = get_db(); conn.execute("INSERT INTO licenses (key, shop_name, phone, address, expiry_date, domain) VALUES (?, ?, ?, ?, ?, NULL)", (key, shop_name, phone, address, expiry)); conn.commit(); conn.close()
-    return redirect('/')
-
-@app.route('/renew_license/<key>', methods=['POST'])
-def renew_license(key):
-    days = int(request.form.get('days', 30))
-    conn = get_db()
-    lic = conn.execute("SELECT expiry_date FROM licenses WHERE key=?", (key,)).fetchone()
-    if lic:
-        current_expiry = datetime.strptime(str(lic['expiry_date']).split('.')[0], "%Y-%m-%d %H:%M:%S")
-        if datetime.now() > current_expiry:
-            new_expiry = datetime.now() + timedelta(days=days)
-        else:
-            new_expiry = current_expiry + timedelta(days=days)
-            
-        conn.execute("UPDATE licenses SET expiry_date=?, status='Active' WHERE key=?", (new_expiry, key))
-        conn.commit()
-    conn.close()
-    return redirect(request.referrer or '/')
-
-@app.route('/block_license/<key>')
-def block_license(key):
-    conn = get_db(); conn.execute("UPDATE licenses SET status='Blocked' WHERE key=?", (key,)); conn.commit(); conn.close(); return redirect(request.referrer or '/')
-
-@app.route('/unblock_license/<key>')
-def unblock_license(key):
-    conn = get_db(); conn.execute("UPDATE licenses SET status='Active' WHERE key=?", (key,)); conn.commit(); conn.close(); return redirect(request.referrer or '/')
-
-@app.route('/delete_license/<key>')
-def delete_license(key):
-    conn = get_db(); conn.execute("DELETE FROM licenses WHERE key=?", (key,)); conn.commit(); conn.close(); return redirect(request.referrer or '/')
-
-@app.route('/verify_license', methods=['POST'])
-def verify_license():
-    key = request.json.get('key'); domain = request.json.get('domain'); conn = get_db()
-    lic = conn.execute("SELECT * FROM licenses WHERE key=?", (key,)).fetchone()
-    
-    if not lic: conn.close(); return jsonify({"valid": False, "reason": "Invalid License Key! (ভুল লাইসেন্স কী)"})
-    if lic['status'] == 'Blocked': conn.close(); return jsonify({"valid": False, "reason": "আপনার লাইসেন্সটি অ্যাডমিন দ্বারা ব্লক করা হয়েছে!"})
-    
-    saved_domain = lic['domain']
-    if not saved_domain: 
-        conn.execute("UPDATE licenses SET domain=? WHERE key=?", (domain, key)); conn.commit()
-    elif saved_domain != domain:
-        conn.execute("INSERT INTO fraud_logs (key, attempted_domain, actual_domain) VALUES (?, ?, ?)", (key, domain, saved_domain))
-        conn.commit(); conn.close()
-        return jsonify({"valid": False, "reason": f"লাইসেন্স লক এরর! এই লাইসেন্সটি অন্য কম্পিউটারে ব্যবহার করার চেষ্টা করা হচ্ছে। Security Alert Sent!"})
-    
-    expiry_date = datetime.strptime(str(lic['expiry_date']).split('.')[0], "%Y-%m-%d %H:%M:%S")
-    if datetime.now() > expiry_date: 
-        conn.close()
-        return jsonify({"valid": False, "reason": "আপনার লাইসেন্সের মেয়াদ শেষ! দয়া করে সফটওয়্যার রিনিউ করুন।"})
-        
-    conn.close()
-    return jsonify({"valid": True, "expiry": expiry_date.strftime("%Y-%m-%d")})
-
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5001))
-    app.run(host='0.0.0.0', port=port)
+    <style>body{{font-family: 'Segoe UI', sans-serif; padding: 20px; background:#fce8e6;}} table{{width: 100%; border-collapse: collapse; background:white; box-shadow:0 4px 10px rgba(0,0,0,0.1);}} th, td{{
